@@ -1,0 +1,77 @@
+### Here is a sketch of design ideas for BUGS modules
+
+This is implemented on branch `BUGSmodules`
+
+```{r}
+library(nimble)
+nimbleOptions(enableBUGSmodules = TRUE) ## feature toggle
+```
+
+Here is the basic idea.  A declaration with BUGS module `lmPred` would get expanded in place:
+
+```{r}
+mc <- nimbleCode({
+    a ~ dnorm(0,1)
+    Ypred[1:n] <- lmPred(X[1:n])
+})
+```
+
+expands to:
+
+```{r}
+nimble:::codeProcessBUGSmodules(mc)
+```
+
+This provides the linear predictors from `X[1:n]` to predict `Ypred[1:n]`.
+
+When option `enableBUGSmodules == TRUE`, this will be done early in processing BUGS code:
+
+```{r}
+X <- 1:5
+m <- nimbleModel(mc, constants = list(n = 5), data = list(X = X))
+```
+
+Note that the functionality in `lmPred` is currently a sham: It replaces the code but not by truly processing it.
+
+One BUGS module can use another.  Say we want a linear model:
+
+```{r}
+mc <- nimbleCode({
+    a ~ dnorm(0,1)
+    Ypred[1:n] ~ nim_lm(X[1:n])
+})
+```
+
+The non-recursed expansion uses the `lmPred` template:
+
+```{r}
+nimble:::nim_lm$process(Ypred[1:n], nim_lm(X[1:n])) ## The processing is fake, to show what the real result would look like.  It generates the response distributions and uses lmPred to expand linear predictions...
+```
+
+This means the recursed expansion has everything:
+
+```{r}
+nimble:::codeProcessBUGSmodules(mc)  ## ... which are then replaced by recursion
+X <- 1:5
+## The full expansion works in a model
+m <- nimbleModel(mc, constants = list(n = 5), data = list(X = X))
+```
+
+It would be easy to remove extra `{`s and collapse identical `for` loops into one.
+
+Similarly, a glm module could use `lmPred` but provide an argument to insert a link:
+
+```{r}
+mc <- nimbleCode({
+    a ~ dnorm(0,1)
+    Ypred[1:n] ~ nim_glm(X[1:n])
+})
+X <- 1:5
+## non-recursed expansion, shows link argument
+nimble:::nim_glm$process(Ypred[1:n], nim_glm(X[1:n])) ## In this case a link is requested in the linear expansion.
+## recursed expansion shows full model
+nimble:::codeProcessBUGSmodules(mc)  ## ... which is then replaced by recursion
+## It works in a fully processed model
+m <- nimbleModel(mc, constants = list(n = 5), data = list(X = X))
+```
+
