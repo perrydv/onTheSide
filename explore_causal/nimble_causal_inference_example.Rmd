@@ -1,0 +1,331 @@
+---
+title: "NIMBLE adaptation of Appendix B example"
+subtitle: "Modified from Appendix B of A ROADMAP FOR ESTIMATING AND INTERPRETING POPULATION INTERVENTION PARAMETERS"
+output:
+  html_document:
+    fig_caption: yes
+    fig_height: 6
+    fig_width: 7
+    keep_tex: yes
+    toc: yes
+---
+```{r setup, echo=TRUE, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list=ls())
+##library(SuperLearner)
+##library(tmle) 
+library(nimble)
+library(xtable)
+```
+
+# Introduction
+
+This is a quick exploration of using NIMBLE for model-generic causal inference based on the example [here](https://ahubb40.github.io/Roadmap/appendix).
+
+I will
+
+* Generate example identically.
+* Make the simpler ("smoother") GLM as a nimbleModel written in BUGS.
+* Estimate parameters by MLE and show they match results from `glm()`
+* Calculate the example causal inference estimators using the models and show they match the ones demostrated in the provided code.
+* Show how we can compile the models and algorithms.
+
+#  Data Generating Model
+
+We could write the data-generating model as a `nimbleModel`, but that's not really the point.  This is the truth unknown to the analyst, so we'll just copy and create identical data.
+
+In this example, A is an exposure and Y is an outcome.  W is an explanatory variable that can affect Y directly and affect the probability of A being 0 or 1.   Because A also has a direct effect on Y, W has an indirect effect on Y via A.   W is a confounding variable because if we look at the marginal effect of A on Y, we would attribute some of the direct effect of W on Y as being an effect of A on Y.  The analysis goal is to isolate the effect of A on Y.  A typical summary of interest (estimand) is the average effect of A on Y, averaged over the distribution of W in the population.
+
+As given in the example, "we can think of A as physical abuse, Y and psychopathology in adulthood, and W as childhood socioeconomic status".
+
+Data simulation copied directly:
+
+```{r}
+dat.gen.2=function(n,probsw,probsa,bY) {
+  W=sample(1:5,n,replace=T,prob=probsw)
+  A=rbinom(n,1,probsa[W])
+  X=cbind(1,A,W-1,(W-1)^2,A*(W-1)^2)
+  PYgivenAW=1/(1+exp(-(X%*%bY)))
+  Y=rbinom(n,1,PYgivenAW)
+  return(data.frame(W,A,Y))
+}
+
+### Definies parameters of data-generating distribution
+#### probsw= P(W=w)
+probsw=c(0.2,0.2,0.2,0.2,0.2)
+#### parameters to define P(A=1 | W)
+probsa = c(seq(0.20,0.05,length=5))
+#### parameters to define P(Y |A, W)
+bY = c(-2,1.5,-0.25,0.1,-0.1)
+### Sample Size
+n=1000
+### Random number seed so can replicate results
+set.seed(4041)
+### Use function with set paramters to generate random 
+#######   sample of data
+dat=dat.gen.2(n,probsw,probsa,bY)
+```
+
+The data `dat` are what we will analyse below.
+
+### Plot the probabilities of Y for each combination of A and W from the true model.
+
+This code is copied from the provided example:
+
+```{r}
+### Get the true values of the relevant distributional 
+###### parameters and plot the true distribuiton
+par(mfrow=c(1,1))
+par(mar = c(5,5,2,5))
+### w at the possible values
+w=1:5
+### design matrix for model for Y given A=0, given W and P(Y|A=0,W)
+Xt=cbind(1,0,w-1,(w-1)^2,0)
+PYgivena0w=1/(1+exp(-(Xt%*%bY)))
+### design matrix for model for Y given A=1, given W and P(Y|A=1,W)
+Xt=cbind(1,1,w-1,(w-1)^2,(w-1)^2)
+PYgivena1w=1/(1+exp(-(Xt%*%bY)))
+### Plot True distribution of Y given A=a,W=w
+plot(w,PYgivena1w,pch="1",ylim=c(0.00,0.5),xlab="w",ylab="P(Y=1|A=a,W=w)")
+points(w,PYgivena0w,pch="0")  			
+```
+
+### Plot the probabilities of A for each level of W from the true model
+
+Again, this is from the provided example.
+
+```{r}
+
+PAgivenW=probsa
+plot(w,PAgivenW,type="s",lty=2,xlab="w",ylab="Propensity Score: P(A=1|W=w)",ylim=c(0,0.2))
+
+	
+```
+
+
+#### "now calculate the true values of the parameters of interest from the simulated data"
+
+I found the phrase from the provided example slightly confusing, probably because I hadn't read the chapter.   The confusion was that I thought we had just calculated the "truth" above, and usually "simulated data" are not the "truth".   I believe the "from the simulated data" refers to where we will ultimately estimate the parameters of interest, not the calculations to be done here (ambiguous), except perhaps for the distributions of W and A.  I believe the points of departure here is that now we are thinking about the models an analyst will estimate, since they don't know the structure of the true model.   This section gives the true values of the parameters of the wrong model.  The provided code in this section is particularly hard to read.
+
+I believe the phrase "parameters of interest" is a term of art that conveys the concept that we are interested in a _function_ of the model's directly estimated parameters and possibly the data.  For example, the model's directly estimated parameters might include coefficiencts for A and W, while the parameter of interest might be an average difference of predicted Y, with the difference between A = 1 and A = 1 and the average over the distribution of W.  The latter is a function of the directly estimated parameters and the data.
+
+In summary, this section is still setup on the way to using nimble for model-generic causal estimates.
+
+The steps below are  copied from the provided example, with a couple of additional outputs and comments.  These are based on the data and the PYgivena1w and PYgivena0w pieces above
+
+
+```{r}
+yprobdat=data.frame(PYgivena0w,PYgivena1w)
+yprobdat=data.frame(W=1:5,pw=probsw,yprobdat)
+yprobdat=data.frame(yprobdat,probsa)
+yprobdat
+## yprobdat is not the probability of the data.  It gives the true probability of Y = 1 for every combination of W and A.  It is not in "tidy" format.
+
+## Get estimates of the parameters that makeup the the relevant
+###### parts of the distribution
+rm(Y,A,W)
+### est of P(Y|A=a,W=w)
+attach(dat)
+yprobobs=NULL
+for(i in 1:5) {
+  pyaw=mean(Y[A==1 & W==i])
+  pyaw=c(pyaw,mean(Y[A==0 & W==i]))
+  yprobobs=rbind(yprobobs,pyaw)
+}
+detach(2)
+yprobobs
+## yprobobs gives the simulated frequencies of Y = 1 for each combination of W (rows) and A (columns).  
+
+### est of P(W=w)
+attach(dat)
+tt=table(A,Y,W) 
+tt
+## tt gives the simulated counts of (A, Y, W) events
+wtab=(table(W)/(length(W)))
+wtab
+## wtab gives the simulated frequencies of W
+detach(2)
+### Organize est elements of distribution into one data frame
+tabout=NULL
+for(i in 1:5) {
+  tabout=rbind(tabout,c(wtab[i],tt[2,2,i],sum(tt[2,,i]),yprobobs[i,1],tt[1,2,i],sum(tt[1,,i]),yprobobs[i,2]))
+}
+colnames(tabout)=paste("est.",c("pw","ny1","na1","pya1w","ny0","na0","pya0w"),sep="")
+tabout
+## tabout gives, for eacy W (row), simulated (labeled "estimated"): frequency of W, count of y==1 & A==1 (labeled only "est.ny1"), count of A == 1, prob(Y = 1 | W, A = 1), count of y == 1 & A == 0 (labeled only "est.ny0", so the 0 is for a and the ny implies y == 1), count of A == 0,  prob(Y = 1 | W, A = 0)
+
+## CODE NOTE: next line would be more readable if you use the column names you've set up.
+res.out=cbind(yprobdat[,c(1:2,4,3)],diff.tr=yprobdat[,4]-yprobdat[,3],
+              tabout,diff.est=tabout[,"est.pya1w"]-tabout[,"est.pya0w"])
+res.out
+##  In res.out: diff.tr is P(Y | A = 1) - P(Y | A = 0)
+
+### CODE NOTE for following: would be more readable if you use the column names you've set up.
+
+### Estimates of CRD and other causal parameters using saturated (nonparametric) estimating model
+crd.sat=sum(tabout[,1]*(tabout[,4]-tabout[,7]))
+#### est E(Y0)
+ey0.sat=sum(tabout[,1]*tabout[,7])
+#### est E(Y1)
+ey1.sat=sum(tabout[,1]*tabout[,4])
+### True CRD
+crd.true=sum(yprobdat[,2]*(yprobdat[,4]-yprobdat[,3]))
+#### true E(Y0)
+ey0.true=sum(yprobdat[,2]*(yprobdat[,3]))
+#### true E(Y1)
+ey1.true=sum(yprobdat[,2]*(yprobdat[,4]))
+#### True EY
+ey.true =sum(yprobdat[,2]*yprobdat[,4]*yprobdat[,5]+(yprobdat[,2]*yprobdat[,3]*(1-yprobdat[,5])))
+### true CPAR
+cpar.true=ey.true-ey0.true
+### est CPAR from saturated model
+cpar.sat=mean(dat[,"Y"])-ey0.sat
+## Figure for observed data
+w=1:5
+a=c(0,1)
+par(mfrow=c(1,1))
+#par(mar = c(5,5,2,5))
+plot(w,yprobobs[,1],pch="1",ylim=c(0.00,0.4),xlab="w",ylab=expression(paste(hat(P),"(Y=1|A=a,W=w)",sep="")))
+points(w,yprobobs[,2],pch="0")  
+
+
+```
+
+# Estimators
+
+The provided example takes the view that a saturated model is "nonparametric". This is estimated by direct calculation.  I will jump to the "smoother (more parametric)" model to illustrate a nimble model.
+
+This is a logistic regression model.
+
+```{r}
+
+## original fit using glm
+glm1=glm(Y~A+factor(W),data=dat,family=binomial())
+
+## nimbleModel
+library(nimble)
+modelCode <- nimbleCode( {
+    for(i in 1:n) {
+        Y[i] ~ dbern(predY[i])
+        W.effect[1] <- 0
+        predY[i] <- expit(intercept + A1.effect * A[i] + W.effect[ W[i] ])
+    }
+})
+
+glmModel <- nimbleModel(modelCode, constants = dat[,'W', drop = FALSE],
+                        data = dat[,c('A', 'Y')], dimensions = list(W.effect = 5))
+## Comments on the model:
+## 1. A more traditional "design matrix %*% parameter vector" works too
+## 2. A wide range of models can be written in BUGS code
+## 3. They don't need to have priors, even though many uses of BUGS are Bayesian
+## 4. We are working on simpler modules for common components like GLMs.
+## 5. A major advantange is that models written in nimble can be used with the same functions.  E.g., one doesn't need to work out how to do "predict" for every different R function or package.
+
+## MLE objective function as a nimbleFunction
+objFunNF <- nimbleFunction(
+    setup = function(model, paramNodes) {
+    },
+    run = function(params = double(1)) {
+        values(model, paramNodes) <<- params
+        return(model$calculate())
+        returnType(double())
+    })
+
+## nimbleFunctions use two-stage evaluation:
+## 1. make an instance of objFunNF for our particular model and parameters. This executes the setup code (empty in this case) and preserves arguments and setup outputs needed for run.
+objFunGLM <- objFunNF(glmModel, c("intercept", "A1.effect", "W.effect[2:5]"))
+## 2. execute the run (or other) method repeatedly.
+objFunGLM$run(c(0, 0, rep(0, 4)))    
+
+## The important thing to notice is that the objFunNF is model-generic: nothing in the code is specific to the glm. The same function can be used for other models.
+
+## We can compile the model via C++:
+cglmModel <- compileNimble(glmModel)
+## And the objective function:
+cobjFunGLM <- compileNimble(objFunGLM)
+
+## We can use optim or another tool to estimate the MLE:
+MLE <- optim(c(0, 0, rep(0, 4)), cobjFunGLM$run, method = 'CG', control = list(fnscale = -1))
+## Compare to result from glm()
+MLE$par - coefficients(glm1)
+## Estimated parameters match within precision
+
+```
+
+I will skip the covariance stuff and focus on the crd estimators.
+
+From the provided code:
+
+```{r}
+datn=dat
+predA=predict(glm1,newdata=datn,type="response")
+### Est E(Y)
+eyA.glm=mean(predA)
+### Est E(Y0)
+datn[,"A"]=0
+predA0=predict(glm1,newdata=datn,type="response")
+eyA0.glm=mean(predA0)
+### Est E(Y1)
+datn[,"A"]=1
+predA1=predict(glm1,newdata=datn,type="response")
+eyA1.glm=mean(predA1)
+### Est CRD
+crd.glm=eyA1.glm-eyA0.glm
+### Est CPAR
+cpar.glm=eyA.glm-eyA0.glm
+# EY(0)
+print(eyA0.glm)
+# EY(1)
+print(eyA1.glm)
+# EY
+print(eyA.glm)
+# crd
+print(crd.glm)
+# cpar
+print(cpar.glm)
+
+```
+
+### Writing the CRD steps as model-generic nimbleFunctions:
+
+```{r}
+
+## Here is a nimbleFunction that estimates prediction nodes (predNodes, in this case predY) and nodes to be changed for the CRD comparison (nodesToChanges, in this case A)
+calcCRDnf <- nimbleFunction(
+    setup = function(model, predNodes, nodesToChange) {
+        predNodes <- model$expandNodeNames(predNodes)
+        nodesToChange <- model$expandNodeNames(nodesToChange)
+    },
+    run = function(valuesToCompare = double(1)) {
+        ## store original values (of A in the case below)
+        origValues <- values(model, nodesToChange)
+        ## put the first new value in the nodes to change
+        values(model, nodesToChange) <<- rep(valuesToCompare[1], length(nodesToChange))
+        ## calculate the model
+        model$calculate()
+        ## record the mean of the predicted values
+        meanForValues1 <- mean(values(model, predNodes))
+        ## put the second new value in the nodes to change
+        values(model, nodesToChange) <<- rep(valuesToCompare[2], length(nodesToChange))
+        ## calculate the model
+        model$calculate()
+        ## record mean of the predicted values
+        meanForValues2 <- mean(values(model, predNodes))
+        ## restore original values
+        values(model, nodesToChange) <<- origValues
+        ## recalculate to leave the model internally consistent
+        model$calculate()
+        ## return first mean, second mean, and difference
+        return(c(meanForValues1, meanForValues2, meanForValues2 - meanForValues1))
+        returnType(double(1))
+    })
+
+## Make an instance for our particular case
+calcCRD <- calcCRDnf(glmModel, 'predY', 'A')
+## compile it
+ccalcCRD <- compileNimble(calcCRD, project = glmModel)
+## run it
+ccalcCRD$run(c(0,1))
+##These numbers match the provide results as follows
+c(eyA0.glm, eyA1.glm, crd.glm)
+```
